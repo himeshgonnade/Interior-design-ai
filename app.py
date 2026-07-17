@@ -4,22 +4,29 @@ AI Interior Design Generator
 A Streamlit app that lets a user pick a room from a house floor plan,
 choose design parameters (style, material, flooring, windows/doors,
 color palette, lighting) and generates a photorealistic interior
-render using a Hugging Face text-to-image model via the Inference API.
+render by calling a free, public Hugging Face Space (Gradio app)
+running FLUX.1-schnell on shared ZeroGPU hardware.
+
+Why a Space instead of the Inference Providers API? Free Hugging Face
+accounts only get $0.10/month of Inference Provider credit (enough for
+a couple of paid-provider images before you're cut off). Hugging Face
+Spaces on ZeroGPU are a genuinely free, no-credit-card, no-billing way
+to run image generation - the trade-off is a shared queue, so it can be
+slower and occasionally busy.
 
 Deploy on Streamlit Community Cloud or run locally:
     streamlit run app.py
 
-Set your Hugging Face token either:
+A Hugging Face token is optional here (it only raises your priority in
+the shared queue). If you want to set one, either:
   1. In Streamlit secrets:  .streamlit/secrets.toml -> HF_API_TOKEN = "hf_xxx"
   2. Or paste it in the sidebar text box at runtime (session only, not stored)
 """
 
 import io
-import requests
 import streamlit as st
 from PIL import Image
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import HfHubHTTPError
+from gradio_client import Client
 
 # --------------------------------------------------------------------------
 # Page config
@@ -33,28 +40,11 @@ st.set_page_config(
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
-MODEL_OPTIONS = {
-    "Stable Diffusion XL Base 1.0 (recommended - free tier)": "stabilityai/stable-diffusion-xl-base-1.0",
-    "Stable Diffusion 2.1 (fastest, free tier)": "stabilityai/stable-diffusion-2-1",
-    "FLUX.1-dev (best quality - paid provider, needs credits)": "black-forest-labs/FLUX.1-dev",
-}
-
-# Models served through paid third-party Inference Providers (fal-ai, Replicate,
-# WaveSpeed, etc). Free HF accounts get a small monthly credit allowance for
-# these and will hit a 402/401 error once it's used up or if no payment method
-# is on file.
-PAID_PROVIDER_MODELS = {"black-forest-labs/FLUX.1-dev"}
-
-# provider="auto" can route a model to whichever backend HF thinks is fastest,
-# which for some models is a paid third-party provider even when a free
-# HF-hosted option exists. Pin the free Stable Diffusion models to HF's own
-# hf-inference backend explicitly so they don't get routed to a paid provider
-# that requires a payment method on file.
-MODEL_PROVIDERS = {
-    "stabilityai/stable-diffusion-xl-base-1.0": "hf-inference",
-    "stabilityai/stable-diffusion-2-1": "hf-inference",
-    "black-forest-labs/FLUX.1-dev": "auto",
-}
+# Official free FLUX.1-schnell demo Space. Apache-2.0 licensed, ungated,
+# runs on shared ZeroGPU hardware at no cost. "schnell" (German for "fast")
+# is distilled for 1-4 step generation, so it's quick even on shared queue.
+SPACE_ID = "black-forest-labs/FLUX.1-schnell"
+SPACE_API_NAME = "/infer"
 
 # Rooms pulled from the sample floor plan you provided
 ROOM_OPTIONS = {
@@ -107,43 +97,36 @@ COLOR_PALETTES = [
 ]
 
 # --------------------------------------------------------------------------
-# Sidebar - API key & model
+# Sidebar - optional token & generation settings
 # --------------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
 
 default_token = st.secrets.get("HF_API_TOKEN", "") if hasattr(st, "secrets") else ""
 hf_token = st.sidebar.text_input(
-    "Hugging Face API Token",
+    "Hugging Face token (optional)",
     value=default_token,
     type="password",
-    help="Create a free token at https://huggingface.co/settings/tokens (Read access is enough).",
+    help=(
+        "Not required to generate images. Adding a free token from "
+        "https://huggingface.co/settings/tokens may improve your position "
+        "in the shared ZeroGPU queue."
+    ),
 )
 
-model_label = st.sidebar.selectbox("Image generation model", list(MODEL_OPTIONS.keys()))
-model_id = MODEL_OPTIONS[model_label]
-
-if model_id in PAID_PROVIDER_MODELS:
-    st.sidebar.warning(
-        "⚠️ This model runs on a paid Inference Provider (fal-ai). Free Hugging "
-        "Face accounts get limited monthly credit for this and may see a "
-        "'402 Payment Required' error once it's used up. Switch to a Stable "
-        "Diffusion option above if that happens."
-    )
+st.sidebar.caption(
+    "This app generates images for free via the public FLUX.1-schnell "
+    "Hugging Face Space, running on shared ZeroGPU hardware. No billing, "
+    "no credits - but it's a shared queue, so generation can occasionally "
+    "be slow or briefly unavailable if the Space is busy or restarting."
+)
 
 with st.sidebar.expander("Advanced generation settings"):
-    guidance_scale = st.slider("Guidance scale (prompt adherence)", 1.0, 15.0, 7.5, 0.5)
-    num_inference_steps = st.slider("Inference steps (quality vs speed)", 10, 50, 30, 5)
-    negative_prompt = st.text_area(
-        "Negative prompt",
-        value="blurry, low quality, distorted proportions, watermark, text, people, cartoon",
+    num_inference_steps = st.slider(
+        "Inference steps", 1, 8, 4,
+        help="FLUX.1-schnell is distilled for ~4 steps. More steps rarely helps and just slows things down.",
     )
-
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "This app calls the Hugging Face Inference API. Some models require you to "
-    "accept usage terms on the model's page before your token can use them, and "
-    "large models may take ~20-60s to 'warm up' on first request."
-)
+    randomize_seed = st.checkbox("Randomize seed each time", value=True)
+    seed = st.number_input("Seed (used only if randomize is off)", min_value=0, value=42, step=1)
 
 # --------------------------------------------------------------------------
 # Header + reference floor plan
@@ -151,7 +134,8 @@ st.sidebar.caption(
 st.title("🏠 AI Interior Design Generator")
 st.write(
     "Pick a room from the floor plan, choose your design preferences, and "
-    "generate a photorealistic interior concept image."
+    "generate a photorealistic interior concept image - free, via a public "
+    "Hugging Face Space."
 )
 
 col_plan, col_form = st.columns([1, 1.4], gap="large")
@@ -196,6 +180,7 @@ with col_form:
     )
 
     aspect_ratio = st.radio("Image orientation", ["Landscape (wide room shot)", "Square"], horizontal=True)
+    # FLUX.1-schnell expects width/height as multiples of 32.
     width, height = (1024, 768) if aspect_ratio.startswith("Landscape") else (1024, 1024)
 
 # --------------------------------------------------------------------------
@@ -227,74 +212,58 @@ st.subheader("Generated Prompt")
 st.code(prompt, language="text")
 
 # --------------------------------------------------------------------------
-# Hugging Face Inference call
+# Free Hugging Face Space call (gradio_client)
 # --------------------------------------------------------------------------
-def generate_image(api_token: str, model: str, prompt: str, negative_prompt: str,
-                    guidance_scale: float, num_inference_steps: int,
-                    width: int, height: int):
-    """
-    Generate an image via huggingface_hub's InferenceClient.
+@st.cache_resource(show_spinner=False)
+def get_space_client(token: str | None):
+    # Caching the Client avoids re-fetching the Space's API description on
+    # every generation, which is slow. Cache key includes the token so
+    # switching between "no token" and "with token" gets a fresh client.
+    return Client(SPACE_ID, token=token or None)
 
-    Each model is only hosted by specific Inference Providers (fal, Replicate,
-    WaveSpeed, hf-inference, etc). provider="auto" lets HF pick the fastest
-    available one, but that can silently select a paid third-party provider
-    even for a model that's also available for free on HF's own hf-inference
-    backend. To avoid unexpected billing errors, free Stable Diffusion models
-    are pinned to hf-inference explicitly via MODEL_PROVIDERS; only models
-    that are exclusively paid (like FLUX.1-dev) fall back to "auto".
-    """
-    provider = MODEL_PROVIDERS.get(model, "auto")
-    client = InferenceClient(provider=provider, api_key=api_token)
 
-    kwargs = dict(
-        model=model,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        num_inference_steps=num_inference_steps,
-        width=width,
-        height=height,
-    )
-
+def generate_image(prompt: str, num_inference_steps: int, width: int, height: int,
+                    randomize_seed: bool, seed: int, token: str):
+    """Call the free FLUX.1-schnell Space and return (PIL.Image, seed_used)."""
     try:
-        return client.text_to_image(prompt, **kwargs)
-    except HfHubHTTPError as e:
-        status = e.response.status_code if e.response is not None else None
+        client = get_space_client(token)
+        result = client.predict(
+            prompt=prompt,
+            seed=int(seed),
+            randomize_seed=randomize_seed,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            api_name=SPACE_API_NAME,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "quota" in msg or ("gpu" in msg and "exceeded" in msg):
+            raise RuntimeError(
+                "The free shared GPU quota for this Space is temporarily "
+                "exhausted. Wait a minute and try again, or add a Hugging "
+                "Face token in the sidebar for better queue priority."
+            ) from e
+        if "timeout" in msg or "timed out" in msg:
+            raise RuntimeError(
+                "The Space took too long to respond (it may be waking up "
+                "from sleep). Please try again."
+            ) from e
+        raise RuntimeError(
+            f"Couldn't reach the free generation Space right now: {e}"
+        ) from e
 
-        if status == 401:
-            raise RuntimeError("Invalid or missing Hugging Face API token.") from e
-        if status == 403:
-            raise RuntimeError(
-                "Access denied for this model/provider combination. Double-check "
-                "on the model's Hugging Face page that you've accepted its license "
-                "(if gated) and that your token has 'Make calls to Inference "
-                "Providers' permission."
-            ) from e
-        if status == 404:
-            raise RuntimeError(
-                "This model isn't available through any Inference Provider right "
-                "now. Try a different model."
-            ) from e
-        if status == 402:
-            raise RuntimeError(
-                "You've used up your free Hugging Face Inference Provider credits "
-                "for this model. Switch to Stable Diffusion XL or SD 2.1 in the "
-                "sidebar (free tier), wait for your monthly credits to reset, or "
-                "upgrade to HF PRO for more included usage."
-            ) from e
-        if status == 503:
-            raise RuntimeError(
-                "The model is warming up on the provider's infrastructure. "
-                "Please wait a few seconds and try again."
-            ) from e
+    # The Space returns (image, seed_used); the image element is typically a
+    # local filepath (or a dict with a "path"/"url" key) depending on gradio
+    # version, so handle both.
+    image_result, used_seed = result[0], result[1]
+    if isinstance(image_result, dict):
+        image_path = image_result.get("path") or image_result.get("url")
+    else:
+        image_path = image_result
 
-        # Some providers reject parameters like negative_prompt/width/height for
-        # certain models - retry with just the essentials before giving up.
-        try:
-            return client.text_to_image(
-                prompt, model=model, num_inference_steps=num_inference_steps
-            )
-        except Exception:
-            raise RuntimeError(f"API error ({status}): {e}") from e
+    image = Image.open(image_path)
+    return image, used_seed
 
 
 st.markdown("---")
@@ -304,40 +273,29 @@ if "generated_images" not in st.session_state:
     st.session_state.generated_images = []
 
 if generate_clicked:
-    if not hf_token:
-        st.error("Please enter your Hugging Face API token in the sidebar first.")
-    else:
-        with st.spinner(f"Generating with {model_label}... this can take up to a minute."):
-            try:
-                image = generate_image(
-                    api_token=hf_token,
-                    model=model_id,
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    guidance_scale=guidance_scale,
-                    num_inference_steps=num_inference_steps,
-                    width=width,
-                    height=height,
-                )
-                st.session_state.generated_images.insert(0, {
-                    "image": image,
-                    "prompt": prompt,
-                    "room": room_label,
-                    "style": style,
-                })
-                st.success("Image generated!")
-            except RuntimeError as e:
-                st.error(str(e))
-            except requests.exceptions.Timeout:
-                st.error("The request timed out. Try again or pick a faster model.")
-            except requests.exceptions.ConnectionError:
-                st.error(
-                    "Couldn't reach the Hugging Face API. This can happen if your "
-                    "network/firewall blocks router.huggingface.co, or Hugging Face "
-                    "is having connectivity issues. Try again in a moment."
-                )
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
+    with st.spinner("Generating via the free FLUX.1-schnell Space... this can take 10-60s depending on the queue."):
+        try:
+            image, used_seed = generate_image(
+                prompt=prompt,
+                num_inference_steps=num_inference_steps,
+                width=width,
+                height=height,
+                randomize_seed=randomize_seed,
+                seed=seed,
+                token=hf_token,
+            )
+            st.session_state.generated_images.insert(0, {
+                "image": image,
+                "prompt": prompt,
+                "room": room_label,
+                "style": style,
+                "seed": used_seed,
+            })
+            st.success("Image generated!")
+        except RuntimeError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")
 
 # --------------------------------------------------------------------------
 # Results gallery
@@ -352,6 +310,7 @@ if st.session_state.generated_images:
         with cols[1]:
             st.caption("Prompt used:")
             st.write(item["prompt"])
+            st.caption(f"Seed: {item['seed']}")
             buf = io.BytesIO()
             item["image"].save(buf, format="PNG")
             st.download_button(
