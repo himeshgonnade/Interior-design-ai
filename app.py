@@ -41,8 +41,20 @@ MODEL_OPTIONS = {
 
 # Models served through paid third-party Inference Providers (fal-ai, Replicate,
 # WaveSpeed, etc). Free HF accounts get a small monthly credit allowance for
-# these and will hit a 402 Payment Required error once it's used up.
+# these and will hit a 402/401 error once it's used up or if no payment method
+# is on file.
 PAID_PROVIDER_MODELS = {"black-forest-labs/FLUX.1-dev"}
+
+# provider="auto" can route a model to whichever backend HF thinks is fastest,
+# which for some models is a paid third-party provider even when a free
+# HF-hosted option exists. Pin the free Stable Diffusion models to HF's own
+# hf-inference backend explicitly so they don't get routed to a paid provider
+# that requires a payment method on file.
+MODEL_PROVIDERS = {
+    "stabilityai/stable-diffusion-xl-base-1.0": "hf-inference",
+    "stabilityai/stable-diffusion-2-1": "hf-inference",
+    "black-forest-labs/FLUX.1-dev": "auto",
+}
 
 # Rooms pulled from the sample floor plan you provided
 ROOM_OPTIONS = {
@@ -223,15 +235,16 @@ def generate_image(api_token: str, model: str, prompt: str, negative_prompt: str
     """
     Generate an image via huggingface_hub's InferenceClient.
 
-    Using this client (instead of hand-rolled requests to a specific router
-    path) matters because each model is only hosted by specific third-party
-    Inference Providers (fal, Replicate, WaveSpeed, hf-inference, etc.) and
-    that mapping changes per model. provider="auto" asks Hugging Face to pick
-    a provider that actually serves the requested model, instead of us
-    guessing a fixed path and getting a false "access denied" for models that
-    simply aren't hosted on that particular backend.
+    Each model is only hosted by specific Inference Providers (fal, Replicate,
+    WaveSpeed, hf-inference, etc). provider="auto" lets HF pick the fastest
+    available one, but that can silently select a paid third-party provider
+    even for a model that's also available for free on HF's own hf-inference
+    backend. To avoid unexpected billing errors, free Stable Diffusion models
+    are pinned to hf-inference explicitly via MODEL_PROVIDERS; only models
+    that are exclusively paid (like FLUX.1-dev) fall back to "auto".
     """
-    client = InferenceClient(provider="auto", api_key=api_token)
+    provider = MODEL_PROVIDERS.get(model, "auto")
+    client = InferenceClient(provider=provider, api_key=api_token)
 
     kwargs = dict(
         model=model,
