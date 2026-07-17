@@ -15,10 +15,11 @@ Set your Hugging Face token either:
 """
 
 import io
-import time
 import requests
 import streamlit as st
 from PIL import Image
+from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
 # --------------------------------------------------------------------------
 # Page config
@@ -205,63 +206,62 @@ st.code(prompt, language="text")
 # --------------------------------------------------------------------------
 def generate_image(api_token: str, model: str, prompt: str, negative_prompt: str,
                     guidance_scale: float, num_inference_steps: int,
-                    width: int, height: int, max_retries: int = 3):
-    """Call the HF Inference API and return a PIL Image, or raise an Exception."""
-    # Hugging Face retired api-inference.huggingface.co in 2025 (it now returns
-    # HTTP 410 / fails to resolve on some networks). All serverless inference
-    # now goes through the router, routed to the "hf-inference" provider.
-    api_url = f"https://router.huggingface.co/hf-inference/models/{model}"
-    headers = {"Authorization": f"Bearer {api_token}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "negative_prompt": negative_prompt,
-            "guidance_scale": guidance_scale,
-            "num_inference_steps": num_inference_steps,
-            "width": width,
-            "height": height,
-        },
-        "options": {"wait_for_model": True},
-    }
+                    width: int, height: int):
+    """
+    Generate an image via huggingface_hub's InferenceClient.
 
-    for attempt in range(max_retries):
-        response = requests.post(api_url, headers=headers, json=payload, timeout=180)
+    Using this client (instead of hand-rolled requests to a specific router
+    path) matters because each model is only hosted by specific third-party
+    Inference Providers (fal, Replicate, WaveSpeed, hf-inference, etc.) and
+    that mapping changes per model. provider="auto" asks Hugging Face to pick
+    a provider that actually serves the requested model, instead of us
+    guessing a fixed path and getting a false "access denied" for models that
+    simply aren't hosted on that particular backend.
+    """
+    client = InferenceClient(provider="auto", api_key=api_token)
 
-        if response.status_code == 200:
-            content_type = response.headers.get("content-type", "")
-            if "image" in content_type:
-                return Image.open(io.BytesIO(response.content))
-            # Some models return JSON with base64 or an error message
-            try:
-                data = response.json()
-            except ValueError:
-                raise RuntimeError("Unexpected response format from the API.")
-            raise RuntimeError(f"API did not return an image: {data}")
+    kwargs = dict(
+        model=model,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        width=width,
+        height=height,
+    )
 
-        if response.status_code == 503:
-            # Model is loading - wait and retry
-            wait_s = 15
-            try:
-                wait_s = response.json().get("estimated_time", 15)
-            except ValueError:
-                pass
-            st.info(f"Model is warming up, retrying in {int(wait_s)}s... "
-                    f"(attempt {attempt + 1}/{max_retries})")
-            time.sleep(min(wait_s, 30))
-            continue
+    try:
+        return client.text_to_image(prompt, **kwargs)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if e.response is not None else None
 
-        if response.status_code == 401:
-            raise RuntimeError("Invalid or missing Hugging Face API token.")
-
-        if response.status_code == 403:
+        if status == 401:
+            raise RuntimeError("Invalid or missing Hugging Face API token.") from e
+        if status == 403:
             raise RuntimeError(
-                "Access denied. This model may require you to accept its license "
-                "on its Hugging Face page before your token can use it."
+                "Access denied for this model/provider combination. Double-check "
+                "on the model's Hugging Face page that you've accepted its license "
+                "(if gated) and that your token has 'Make calls to Inference "
+                "Providers' permission."
+            ) from e
+        if status == 404:
+            raise RuntimeError(
+                "This model isn't available through any Inference Provider right "
+                "now. Try a different model."
+            ) from e
+        if status == 503:
+            raise RuntimeError(
+                "The model is warming up on the provider's infrastructure. "
+                "Please wait a few seconds and try again."
+            ) from e
+
+        # Some providers reject parameters like negative_prompt/width/height for
+        # certain models - retry with just the essentials before giving up.
+        try:
+            return client.text_to_image(
+                prompt, model=model, num_inference_steps=num_inference_steps
             )
-
-        raise RuntimeError(f"API error {response.status_code}: {response.text[:300]}")
-
-    raise RuntimeError("Model did not finish loading after several retries. Please try again.")
+        except Exception:
+            raise RuntimeError(f"API error ({status}): {e}") from e
 
 
 st.markdown("---")
