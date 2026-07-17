@@ -207,7 +207,10 @@ def generate_image(api_token: str, model: str, prompt: str, negative_prompt: str
                     guidance_scale: float, num_inference_steps: int,
                     width: int, height: int, max_retries: int = 3):
     """Call the HF Inference API and return a PIL Image, or raise an Exception."""
-    api_url = f"https://api-inference.huggingface.co/models/{model}"
+    # Hugging Face retired api-inference.huggingface.co in 2025 (it now returns
+    # HTTP 410 / fails to resolve on some networks). All serverless inference
+    # now goes through the router, routed to the "hf-inference" provider.
+    api_url = f"https://router.huggingface.co/hf-inference/models/{model}"
     headers = {"Authorization": f"Bearer {api_token}"}
     payload = {
         "inputs": prompt,
@@ -294,6 +297,12 @@ if generate_clicked:
                 st.error(str(e))
             except requests.exceptions.Timeout:
                 st.error("The request timed out. Try again or pick a faster model.")
+            except requests.exceptions.ConnectionError:
+                st.error(
+                    "Couldn't reach the Hugging Face API. This can happen if your "
+                    "network/firewall blocks router.huggingface.co, or Hugging Face "
+                    "is having connectivity issues. Try again in a moment."
+                )
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
 
