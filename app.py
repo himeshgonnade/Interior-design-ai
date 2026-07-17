@@ -34,10 +34,15 @@ st.set_page_config(
 # Constants
 # --------------------------------------------------------------------------
 MODEL_OPTIONS = {
-    "FLUX.1-dev (best quality, slower)": "black-forest-labs/FLUX.1-dev",
-    "Stable Diffusion XL Base 1.0 (balanced)": "stabilityai/stable-diffusion-xl-base-1.0",
-    "Stable Diffusion 2.1 (fastest)": "stabilityai/stable-diffusion-2-1",
+    "Stable Diffusion XL Base 1.0 (recommended - free tier)": "stabilityai/stable-diffusion-xl-base-1.0",
+    "Stable Diffusion 2.1 (fastest, free tier)": "stabilityai/stable-diffusion-2-1",
+    "FLUX.1-dev (best quality - paid provider, needs credits)": "black-forest-labs/FLUX.1-dev",
 }
+
+# Models served through paid third-party Inference Providers (fal-ai, Replicate,
+# WaveSpeed, etc). Free HF accounts get a small monthly credit allowance for
+# these and will hit a 402 Payment Required error once it's used up.
+PAID_PROVIDER_MODELS = {"black-forest-labs/FLUX.1-dev"}
 
 # Rooms pulled from the sample floor plan you provided
 ROOM_OPTIONS = {
@@ -104,6 +109,14 @@ hf_token = st.sidebar.text_input(
 
 model_label = st.sidebar.selectbox("Image generation model", list(MODEL_OPTIONS.keys()))
 model_id = MODEL_OPTIONS[model_label]
+
+if model_id in PAID_PROVIDER_MODELS:
+    st.sidebar.warning(
+        "⚠️ This model runs on a paid Inference Provider (fal-ai). Free Hugging "
+        "Face accounts get limited monthly credit for this and may see a "
+        "'402 Payment Required' error once it's used up. Switch to a Stable "
+        "Diffusion option above if that happens."
+    )
 
 with st.sidebar.expander("Advanced generation settings"):
     guidance_scale = st.slider("Guidance scale (prompt adherence)", 1.0, 15.0, 7.5, 0.5)
@@ -247,6 +260,13 @@ def generate_image(api_token: str, model: str, prompt: str, negative_prompt: str
             raise RuntimeError(
                 "This model isn't available through any Inference Provider right "
                 "now. Try a different model."
+            ) from e
+        if status == 402:
+            raise RuntimeError(
+                "You've used up your free Hugging Face Inference Provider credits "
+                "for this model. Switch to Stable Diffusion XL or SD 2.1 in the "
+                "sidebar (free tier), wait for your monthly credits to reset, or "
+                "upgrade to HF PRO for more included usage."
             ) from e
         if status == 503:
             raise RuntimeError(
